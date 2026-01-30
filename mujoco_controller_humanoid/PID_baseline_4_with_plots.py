@@ -1,0 +1,530 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import gymnasium as gym
+import mujoco
+from g1_arm_rl_env import G1ArmReachEnv
+
+# ============================================================
+# Core Control Primitives
+# ============================================================
+
+def task_space_impedance(p, v, p_goal, Kp=80.0, Kd=15.0):
+    return Kp * (p_goal - p) - Kd * v
+
+
+def damped_jacobian_pinv(J, damping=1e-2):
+    JJt = J @ J.T
+    return J.T @ np.linalg.inv(JJt + damping * np.eye(JJt.shape[0]))
+
+
+def nullspace_control(q, dq, q_rest, K_null=0.4, Kd_null=0.3):
+    return -K_null * (q - q_rest) - Kd_null * dq
+
+
+def jerk_regularization(dq, dq_prev, K_jerk=0.15):
+    if dq_prev is None:
+        return dq
+    return dq - K_jerk * (dq - dq_prev)
+
+
+def rate_limit(x, x_prev, max_rate, dt):
+    if x_prev is None:
+        return x
+    dx = x - x_prev
+    dx = np.clip(dx, -max_rate * dt, max_rate * dt)
+    return x_prev + dx
+
+
+def soft_clip(x, limit):
+    return limit * np.tanh(x / limit)
+
+
+# ============================================================
+# Phase-aware authority & smoothing
+# ============================================================
+
+def task_authority_scale(dist, d_far=0.30, d_near=0.05):
+    if dist > d_far:
+        return 0.6
+    if dist < d_near:
+        return 1.2
+    w = (d_far - dist) / (d_far - d_near)
+    return 0.6 + 0.6 * w
+
+
+def adaptive_lowpass(x, x_prev, dist,
+                     alpha_far=0.95,
+                     alpha_near=0.6,
+                     d_near=0.05):
+    if x_prev is None:
+        return x
+    alpha = alpha_near if dist < d_near else alpha_far
+    return alpha * x_prev + (1.0 - alpha) * x
+
+
+def torso_safety_scale(p, torso_pos=np.array([0.0, 0.0, 0.90]), safe_radius=0.25):
+    d = np.linalg.norm(p - torso_pos)
+    if d >= safe_radius:
+        return 1.0
+    return np.clip(d / safe_radius, 0.2, 1.0)
+
+
+# ============================================================
+# Analytic Jacobian (MuJoCo)
+# ============================================================
+
+# def compute_jacobian_analytic(env, q, body_name="right_wrist_yaw_link"):
+#     for idx, val in zip(env._qadr, q):
+#         env.data.qpos[idx] = val
+#     mujoco.mj_forward(env.model, env.data)
+
+#     jacp = np.zeros((3, env.model.nv))
+#     jacr = np.zeros((3, env.model.nv))
+
+#     body_id = mujoco.mj_name2id(
+#         env.model,
+#         mujoco.mjtObj.mjOBJ_BODY,
+#         body_name
+#     )
+#     if body_id < 0:
+#         raise ValueError(f"Body '{body_name}' not found")
+
+#     mujoco.mj_jacBody(env.model, env.data, jacp, jacr, body_id)
+
+#     return jacp[:, env._qadr]
+
+def compute_jacobian(env, q, eps=1e-4):
+    for idx, val in zip(env._qadr, q):
+        env.data.qpos[idx] = val
+    env._mujoco.mj_forward(env.model, env.data)
+
+    p0 = env._fk()
+    J = np.zeros((3, len(q)))
+
+    for i in range(len(q)):
+        dq = q.copy()
+        dq[i] += eps
+        for idx, val in zip(env._qadr, dq):
+            env.data.qpos[idx] = val
+        env._mujoco.mj_forward(env.model, env.data)
+        pi = env._fk()
+        J[:, i] = (pi - p0) / eps
+
+    return J
+
+def compute_jacobian_point(env, q, body_name, point_offset):
+    """
+    Analytic Jacobian of an arbitrary point rigidly attached to a body.
+    point_offset is expressed in the BODY frame.
+    """
+
+    for idx, val in zip(env._qadr, q):
+        env.data.qpos[idx] = val
+    mujoco.mj_forward(env.model, env.data)
+
+    jacp = np.zeros((3, env.model.nv))
+    jacr = np.zeros((3, env.model.nv))
+
+    body_id = mujoco.mj_name2id(
+        env.model, mujoco.mjtObj.mjOBJ_BODY, body_name
+    )
+
+    mujoco.mj_jacBody(env.model, env.data, jacp, jacr, body_id)
+
+    # World rotation of body
+    R = env.data.xmat[body_id].reshape(3, 3)
+
+    # Offset in world frame
+    r = R @ np.asarray(point_offset)
+
+    # Correct linear Jacobian: Jp_point = Jp_body + ω × r
+    Jp = jacp + np.cross(jacr.T, r).T
+
+    # Extract arm DOFs
+    arm_dofs = [env.model.jnt_dofadr[j] for j in env._arm_joint_ids]
+    return Jp[:, arm_dofs]
+
+
+# ============================================================
+# Experiment Setup
+# ============================================================
+
+N_EPISODES = 100
+MAX_STEPS = 400
+
+env = G1ArmReachEnv(render_mode="human")
+env._arm_joint_names = [
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint",
+]
+
+env._arm_joint_ids = [
+    mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    for name in env._arm_joint_names
+]
+
+# import mujoco
+
+# print("\n=== MuJoCo MODEL INTROSPECTION ===")
+
+# print(f"Number of sites: {env.model.nsite}")
+# print("Site names:")
+# for i in range(env.model.nsite):
+#     name = mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_SITE, i)
+#     print(f"  {i}: {name}")
+
+# print(f"\nNumber of bodies: {env.model.nbody}")
+# print("Body names:")
+# for i in range(env.model.nbody):
+#     name = mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_BODY, i)
+#     print(f"  {i}: {name}")
+
+# print(f"\nNumber of joints: {env.model.njnt}")
+# print("Joint names:")
+# for i in range(env.model.njnt):
+#     name = mujoco.mj_id2name(env.model, mujoco.mjtObj.mjOBJ_JOINT, i)
+#     print(f"  {i}: {name}")
+
+# print("=================================\n")
+
+
+q_slice = slice(0, 7)
+dq_slice = slice(7, 14)
+p_hand_slice = slice(14, 17)
+p_goal_slice = slice(17, 20)
+
+all_final_dists = []
+all_joint_delta_rates = []
+task_errors_all = []
+lyapunov_all = []
+null_norm_all = []
+power_all = []
+cond_all = []
+init_dists = []
+
+# ============================================================
+# Rollouts
+# ============================================================
+
+for ep in range(N_EPISODES):
+    obs, _ = env.reset()
+
+    prev_dq_raw = None
+    prev_dq_cmd = None
+    rates = []
+    task_errors = []
+    lyapunov = []
+    null_norm = []
+    power = []
+    cond = []
+
+    init_dists.append(np.linalg.norm(obs[p_goal_slice] - obs[p_hand_slice]))
+
+
+    for step in range(MAX_STEPS):
+        q = obs[q_slice]
+        dq = obs[dq_slice]
+        p_hand = obs[p_hand_slice]
+        p_goal = obs[p_goal_slice]
+        dt = env.model.opt.timestep
+
+        dist = np.linalg.norm(p_goal - p_hand)
+
+        # --- Jacobian ---
+        # J = compute_jacobian_site_arm_only(env, q)
+        # J = compute_jacobian(env, q)
+        J = compute_jacobian_point(
+            env,
+            q,
+            body_name="right_wrist_yaw_link",
+            point_offset=[0.0415, -0.003, 0.0]
+        )
+        v_hand = J @ dq
+
+        # --- Task-space impedance ---
+        F = task_space_impedance(p_hand, v_hand, p_goal)
+        F *= task_authority_scale(dist)
+
+        # --- Task → joint ---
+        J_pinv = damped_jacobian_pinv(J)
+        dq_task = J_pinv @ F
+
+        # --- Null-space posture ---
+        dq_null = nullspace_control(q, dq, q_rest=np.zeros_like(q))
+        N = np.eye(len(q)) - J_pinv @ J
+        dq_cmd = dq_task + N @ dq_null
+
+        # --- Smoothness ---
+        dq_cmd = jerk_regularization(dq_cmd, prev_dq_raw)
+        dq_cmd = adaptive_lowpass(dq_cmd, prev_dq_cmd, dist)
+        dq_cmd = rate_limit(dq_cmd, prev_dq_cmd, max_rate=2.0, dt=dt)
+
+        # --- Safety ---
+        dq_cmd *= torso_safety_scale(p_hand)
+        dq_cmd = soft_clip(dq_cmd, 0.8 * env.action_space.high)
+
+        if not np.isfinite(dq_cmd).all():
+            dq_cmd = np.zeros_like(dq_cmd)
+
+        dq_cmd = dq_cmd.astype(np.float32)
+
+        obs, reward, done, truncated, info = env.step(dq_cmd)
+
+        # --- Rate logging ---
+        # --- Recompute state AFTER step (critical) ---
+        q2 = obs[q_slice]
+        dq2 = obs[dq_slice]
+        p_hand2 = obs[p_hand_slice]
+        p_goal2 = obs[p_goal_slice]
+
+        # --- Task error & Lyapunov (now correct) ---
+        err = np.linalg.norm(p_goal2 - p_hand2)
+        task_errors.append(err)
+        lyapunov.append(0.5 * err**2)
+
+        # --- Null-space metrics (more meaningful) ---
+        dq_null_comp = N @ dq_null        # isolate null-space component
+        null_norm.append(np.linalg.norm(dq_null_comp))
+
+        # --- Power injection (use updated hand velocity estimate) ---
+        # If you don't have analytic v_hand from obs, keep using pre-step v_hand,
+        # but at least reject non-finite.
+        pinj = float(np.dot(F, v_hand))
+        power.append(pinj if np.isfinite(pinj) else np.nan)
+
+        # --- Jacobian conditioning (robust) ---
+        condJ = np.linalg.cond(J)
+        cond.append(condJ if np.isfinite(condJ) else np.nan)
+
+        if prev_dq_cmd is None:
+            rate = np.zeros_like(dq_cmd)
+        else:
+            rate = (dq_cmd - prev_dq_cmd) / dt
+
+        rates.append(rate.copy())
+
+        prev_dq_raw = dq_cmd.copy()
+        prev_dq_cmd = dq_cmd.copy()
+
+        env.render()
+        if done or truncated:
+            break
+
+    all_joint_delta_rates.append(np.stack(rates))
+    all_final_dists.append(dist)
+    task_errors_all.append(np.array(task_errors))
+    lyapunov_all.append(np.array(lyapunov))
+    null_norm_all.append(np.array(null_norm))
+    power_all.append(np.array(power))
+    cond_all.append(np.array(cond))
+
+    print(f"Episode {ep+1}: steps={step+1}, final dist={dist:.4f} m")
+
+
+# ============================================================
+# Diagnostics
+# ============================================================
+
+def pad_3d(arrs, pad_val=np.nan):
+    n = len(arrs)
+    T = max(a.shape[0] for a in arrs)
+    D = arrs[0].shape[1]
+    out = np.full((n, T, D), pad_val)
+    for i, a in enumerate(arrs):
+        out[i, :a.shape[0]] = a
+    return out
+
+def pad_2d(arrs, pad_val=np.nan):
+    T = max(len(a) for a in arrs)
+    out = np.full((len(arrs), T), pad_val)
+    for i, a in enumerate(arrs):
+        out[i, :len(a)] = a
+    return out
+err_pad = pad_2d(task_errors_all)
+
+plt.figure(figsize=(8,4))
+plt.plot(np.nanmean(err_pad, axis=0), 'k', lw=2)
+plt.fill_between(
+    np.arange(err_pad.shape[1]),
+    np.nanmean(err_pad, axis=0) - np.nanstd(err_pad, axis=0),
+    np.nanmean(err_pad, axis=0) + np.nanstd(err_pad, axis=0),
+    alpha=0.3
+)
+plt.xlabel("Timestep")
+plt.ylabel("‖x − x_d‖ (m)")
+plt.title("Task Error Convergence")
+plt.tight_layout()
+plt.show()
+
+
+V_pad = pad_2d(lyapunov_all)
+
+plt.figure(figsize=(8,4))
+plt.plot(np.nanmean(V_pad, axis=0), 'k', lw=2)
+plt.xlabel("Timestep")
+plt.ylabel("V(x)")
+plt.title("Lyapunov Function Evolution")
+plt.tight_layout()
+plt.show()
+
+from scipy.signal import welch
+
+rates_3d = pad_3d(all_joint_delta_rates)  # (E, T, 7)
+dt = env.model.opt.timestep
+fs = 1.0 / dt
+
+jerk_flat = rates_3d.reshape(-1, rates_3d.shape[2])  # (E*T, 7)
+
+# REMOVE NaNs introduced by padding
+mask = np.isfinite(jerk_flat).all(axis=1)
+jerk_flat = jerk_flat[mask]
+
+if jerk_flat.shape[0] > 10:
+    freqs, psd = welch(
+        jerk_flat,
+        fs=fs,
+        axis=0,
+        nperseg=min(256, jerk_flat.shape[0])
+    )
+
+    plt.figure(figsize=(8, 4))
+    plt.semilogy(freqs, np.mean(psd, axis=1), lw=2)
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("PSD (rad²/s⁴/Hz)")
+    plt.title("Spectral Content of Joint Jerk (Welch PSD)")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("PSD skipped: not enough finite jerk samples.")
+
+
+
+
+null_pad = pad_2d(null_norm_all)
+
+plt.figure(figsize=(8,4))
+plt.plot(np.nanmean(null_pad, axis=0), 'k', lw=2)
+plt.xlabel("Timestep")
+plt.ylabel("‖N dq‖")
+plt.title("Null-Space Activity")
+plt.tight_layout()
+plt.show()
+
+
+power_pad = pad_2d(power_all)
+
+plt.figure(figsize=(8,4))
+plt.plot(np.nanmean(power_pad, axis=0), 'k', lw=2)
+plt.axhline(0, color='r', linestyle='--')
+plt.xlabel("Timestep")
+plt.ylabel("Power (W)")
+plt.title("Task-Space Power Injection")
+plt.tight_layout()
+plt.show()
+
+
+cond_pad = pad_2d(cond_all)
+
+mean_cond = np.nanmean(cond_pad, axis=0)
+std_cond  = np.nanstd(cond_pad, axis=0)
+
+# Clip for plotting stability (optional)
+mean_cond = np.clip(mean_cond, 1e0, 1e6)
+
+plt.figure(figsize=(8,4))
+plt.plot(mean_cond, 'k', lw=2)
+plt.yscale("log")
+plt.xlabel("Timestep")
+plt.ylabel("cond(J)")
+plt.title("Jacobian Condition Number vs Time")
+plt.tight_layout()
+plt.show()
+
+success = (np.array(all_final_dists) < 0.02)
+init_dists_np = np.array(init_dists)
+
+bins = np.linspace(init_dists_np.min(), init_dists_np.max(), 8)
+bin_centers = 0.5 * (bins[:-1] + bins[1:])
+
+sr = []
+for i in range(len(bins)-1):
+    mask = (init_dists_np >= bins[i]) & (init_dists_np < bins[i+1])
+    if mask.any():
+        sr.append(success[mask].mean())
+    else:
+        sr.append(np.nan)
+
+sr = np.array(sr)
+valid = np.isfinite(sr)
+
+plt.figure(figsize=(8,4))
+plt.plot(bin_centers[valid], sr[valid], 'o-', lw=2)
+plt.xlabel("Initial Distance (m)")
+plt.ylabel("Success Rate")
+plt.title("Success Rate vs Initial Distance")
+plt.ylim([0, 1.05])
+plt.tight_layout()
+plt.show()
+
+
+
+rms_jerk_ep = [
+    np.sqrt(np.mean(np.linalg.norm(r, axis=1)**2))
+    for r in all_joint_delta_rates
+]
+
+plt.figure(figsize=(6,6))
+plt.scatter(all_final_dists, rms_jerk_ep, c='k')
+plt.xlabel("Final Error (m)")
+plt.ylabel("RMS Jerk (rad/s²)")
+plt.title("Jerk–Accuracy Pareto Frontier")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+rates_3d = pad_3d(all_joint_delta_rates)
+rms_rate = np.sqrt(np.nanmean(rates_3d**2, axis=2))
+
+mean_rms = np.nanmean(rms_rate, axis=0)
+std_rms = np.nanstd(rms_rate, axis=0)
+
+plt.figure(figsize=(10, 4))
+plt.plot(mean_rms, 'k', lw=2)
+plt.fill_between(
+    np.arange(len(mean_rms)),
+    mean_rms - std_rms,
+    mean_rms + std_rms,
+    alpha=0.3
+)
+plt.xlabel("Timestep")
+plt.ylabel("RMS d(Δq)/dt (rad/s²)")
+plt.title("Command Smoothness (Mean ± Std)")
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8, 4))
+plt.plot(all_final_dists, 'o-')
+plt.xlabel("Episode")
+plt.ylabel("Final Distance (m)")
+plt.title("Final Distance to Target")
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+
+
+print("\n=== SANITY CHECKS ===")
+print("Episodes:", len(all_joint_delta_rates))
+print("Mean episode length:", np.mean([a.shape[0] for a in all_joint_delta_rates]))
+print("Final dist mean/std:", np.mean(all_final_dists), np.std(all_final_dists))
+
+print("Task error lengths:", np.mean([len(a) for a in task_errors_all]))
+print("Power finite fraction:", np.mean([np.isfinite(a).mean() for a in power_all]))
+print("Cond finite fraction:", np.mean([np.isfinite(a).mean() for a in cond_all]))
+print("=====================\n")
