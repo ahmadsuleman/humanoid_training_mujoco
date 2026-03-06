@@ -1,4 +1,6 @@
-# Abstract
+#Residual Reinforcement Learning for Stable Mocap-to-Humanoid Motion Transfer
+
+## Abstract
 
 Learning physically stable humanoid motion from human demonstrations remains a challenging problem due to kinematic mismatch and dynamic inconsistencies between human motion capture data and robotic embodiments. Motion capture (mocap) datasets provide a rich source of human motion demonstrations, but directly transferring these trajectories to humanoid robots often leads to instability, kinematic mismatch, and motion artifacts due to differences between human and robot morphologies.
 
