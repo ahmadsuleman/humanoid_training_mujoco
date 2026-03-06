@@ -1,4 +1,21 @@
-#abstract
-Learning physically stable humanoid motion from human demonstrations remains a challenging problem due to kinematic mismatch and dynamic inconsistencies between human motion capture data and robotic embodiments. Motion capture (mocap) datasets provide a rich source of human motion demonstrations, but directly transferring these trajectories to humanoid robots often leads to instability, kinematic mismatch, and motion artifacts due to differences between human and robot morphologies. In this work, we present a reinforcement learning framework for smooth and stable mocap-to-humanoid motion transfer using the Unitree G1 robot in MuJoCo simulation. Our approach treats mocap trajectories as reference motions and trains a control policy to minimize pose tracking error while enforcing smoothness and physical stability constraints. To address retargeting noise and dynamic inconsistencies, the policy learns corrective actions that refine reference trajectories through residual control, improving balance, reducing jitter, and mitigating motion artifacts. The reward formulation combines pose tracking accuracy, motion smoothness, contact consistency, and control efficiency, enabling the robot to produce physically plausible movements while remaining faithful to the original mocap demonstrations. Experiments across diverse motion sequences show that the proposed method significantly improves motion stability and smoothness compared to direct trajectory replay and baseline tracking controllers. These results highlight the potential of reinforcement learning as a scalable approach for bridging human motion datasets and physically consistent humanoid control in simulation and future real-world deployment.
+# Abstract
 
-##Keywords: Reinforcement Learning for Control, Humanoid Motion Learning, Motion Capture Retargeting, Embodied Intelligence, Continuous Control in Dynamical Systems, Humanoid Robotics, Physics-Based Simulation.
+Learning physically stable humanoid motion from human demonstrations remains a challenging problem due to kinematic mismatch and dynamic inconsistencies between human motion capture data and robotic embodiments. Motion capture (mocap) datasets provide a rich source of human motion demonstrations, but directly transferring these trajectories to humanoid robots often leads to instability, kinematic mismatch, and motion artifacts due to differences between human and robot morphologies.
+
+In this work, we present a reinforcement learning framework for smooth and stable mocap-to-humanoid motion transfer using the Unitree G1 robot in MuJoCo simulation. Our approach treats mocap trajectories as reference motions and trains a control policy to minimize pose tracking error while enforcing smoothness and physical stability constraints.
+
+To address retargeting noise and dynamic inconsistencies, the policy learns corrective actions that refine reference trajectories through residual control, improving balance, reducing jitter, and mitigating motion artifacts. The reward formulation combines pose tracking accuracy, motion smoothness, contact consistency, and control efficiency, enabling the robot to produce physically plausible movements while remaining faithful to the original mocap demonstrations.
+
+Experiments across diverse motion sequences show that the proposed method significantly improves motion stability and smoothness compared to direct trajectory replay and baseline tracking controllers. These results highlight the potential of reinforcement learning as a scalable approach for bridging human motion datasets and physically consistent humanoid control in simulation and future real-world deployment.
+
+---
+
+## Keywords
+
+- Reinforcement Learning for Control  
+- Humanoid Motion Learning  
+- Motion Capture Retargeting  
+- Embodied Intelligence  
+- Continuous Control in Dynamical Systems  
+- Humanoid Robotics  
+- Physics-Based Simulation
