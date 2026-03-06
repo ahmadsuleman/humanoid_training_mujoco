@@ -1,4 +1,4 @@
-#Residual Reinforcement Learning for Stable Mocap-to-Humanoid Motion Transfer
+# Residual Reinforcement Learning for Stable Mocap-to-Humanoid Motion Transfer
 
 ## Abstract
 
